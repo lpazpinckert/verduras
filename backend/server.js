@@ -7,7 +7,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 
-const { DATABASE_URL, JWT_SECRET, FRONTEND_URL, ALLOW_REGISTER } = process.env;
+const { DATABASE_URL, JWT_SECRET, FRONTEND_URL, ALLOW_REGISTER, INVITE_CODE } = process.env;
+const TABLES = ["days", "orders", "pagos"];
 const PORT = process.env.PORT || 3000;
 if (!DATABASE_URL || !JWT_SECRET) {
   console.error("Faltan las variables DATABASE_URL y/o JWT_SECRET");
@@ -34,7 +35,7 @@ const isObj = o => o && typeof o === "object" && !Array.isArray(o);
 
 async function init() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
-  for (const t of ["days", "orders"])
+  for (const t of TABLES)
     await pool.query(`CREATE TABLE IF NOT EXISTS ${t}(user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE, fecha TEXT NOT NULL, items JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(user_id, fecha))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS config(user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, cfg JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT now())`);
 }
@@ -49,7 +50,9 @@ app.post("/api/auth/register", limiter, wrap(async (req, res) => {
   if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: "Correo no válido" });
   if (pw.length < 6) return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres" });
   const n = (await pool.query("SELECT COUNT(*)::int AS n FROM users")).rows[0].n;
+  const code = String(req.body.code || "").trim();
   if (n > 0 && ALLOW_REGISTER !== "true") return res.status(403).json({ error: "El registro está cerrado" });
+  if (n > 0 && INVITE_CODE && code !== INVITE_CODE) return res.status(403).json({ error: "Código de invitación incorrecto" });
   if ((await pool.query("SELECT 1 FROM users WHERE email=$1", [email])).rowCount) return res.status(409).json({ error: "Ese correo ya existe" });
   const u = (await pool.query("INSERT INTO users(email,password_hash) VALUES($1,$2) RETURNING id", [email, await bcrypt.hash(pw, 10)])).rows[0];
   res.json({ token: sign(u) });
@@ -64,15 +67,15 @@ app.post("/api/auth/login", limiter, wrap(async (req, res) => {
 }));
 
 app.get("/api/data", auth, wrap(async (req, res) => {
-  const out = { days: {}, orders: {}, cfg: null };
-  for (const t of ["days", "orders"])
+  const out = { days: {}, orders: {}, pagos: {}, cfg: null };
+  for (const t of TABLES)
     (await pool.query(`SELECT fecha, items FROM ${t} WHERE user_id=$1`, [req.uid])).rows.forEach(r => out[t][r.fecha] = r.items);
   const c = (await pool.query("SELECT cfg FROM config WHERE user_id=$1", [req.uid])).rows[0];
   if (c) out.cfg = c.cfg;
   res.json(out);
 }));
 
-for (const t of ["days", "orders"]) {
+for (const t of TABLES) {
   app.put(`/api/${t}/:fecha`, auth, wrap(async (req, res) => {
     if (!FECHA.test(req.params.fecha) || !isObj(req.body.items)) return res.status(400).json({ error: "Datos no válidos" });
     await pool.query(
